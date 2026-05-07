@@ -18,12 +18,15 @@ import os
 import re
 import json
 import uuid
+import base64
 import sqlite3
 import traceback
 from io import BytesIO
 from typing import Optional
 
 import pandas as pd
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -180,71 +183,114 @@ def _safe_col(name: str) -> str:
     return ("col_" + s) if s and s[0].isdigit() else (s or "unnamed")
 
 
-def load_excel_bytes(raw_bytes: bytes, filename: str) -> tuple[pd.DataFrame, sqlite3.Connection, dict]:
+def _safe_table(name: str) -> str:
+    """Sanitize a sheet name to a valid SQLite table identifier."""
+    s = re.sub(r"[^\w]", "_", str(name).strip())
+    s = re.sub(r"_+", "_", s).strip("_").lower()
+    return ("tbl_" + s) if (s and s[0].isdigit()) else (s or "sheet")
+
+
+def load_excel_bytes(
+    raw_bytes: bytes, filename: str
+) -> tuple[dict[str, pd.DataFrame], sqlite3.Connection, dict[str, dict]]:
+    """Load ALL sheets from an Excel file into one in-memory SQLite database.
+
+    Returns
+    -------
+    sheets   : {table_name: DataFrame} — one entry per non-empty sheet
+    conn     : in-memory SQLite connection with every sheet as its own table
+    col_maps : {table_name: {original_col_name: sanitized_col_name}}
+    """
     engine = "xlrd" if filename.endswith(".xls") else "openpyxl"
-    raw = pd.read_excel(BytesIO(raw_bytes), engine=engine)
-
-    originals = raw.columns.tolist()
-    seen: dict[str, int] = {}
-    clean: list[str] = []
-    for c in originals:
-        base = _safe_col(str(c))
-        if base in seen:
-            seen[base] += 1
-            clean.append(f"{base}_{seen[base]}")
-        else:
-            seen[base] = 0
-            clean.append(base)
-
-    raw.columns = clean
-    col_map = dict(zip(originals, clean))
+    all_sheets: dict = pd.read_excel(BytesIO(raw_bytes), engine=engine, sheet_name=None)
 
     conn = sqlite3.connect(":memory:", check_same_thread=False)
-    raw.to_sql("audit_data", conn, if_exists="replace", index=False)
-    return raw, conn, col_map
+    sheets: dict[str, pd.DataFrame] = {}
+    col_maps: dict[str, dict] = {}
 
+    for sheet_name, raw in all_sheets.items():
+        # Skip sheets that are entirely blank
+        if raw.empty or raw.dropna(how="all").empty:
+            continue
 
-def build_schema(df: pd.DataFrame) -> str:
-    lines = [
-        "=== SQLITE DATABASE SCHEMA ===",
-        "TABLE NAME : audit_data",
-        f"TOTAL ROWS : {len(df):,}",
-        "",
-        "COLUMNS  (use these EXACT names in every SQL query)",
-        "─" * 60,
-    ]
+        # Sanitize sheet name → valid SQL table name; handle name collisions
+        base = _safe_table(str(sheet_name))
+        table_name = base
+        n_dup = 2
+        while table_name in sheets:
+            table_name = f"{base}_{n_dup}"
+            n_dup += 1
 
-    for col in df.columns:
-        s = df[col]
-        non_null = int(s.notna().sum())
-        lines.append(f"\n{col}")
-
-        if pd.api.types.is_numeric_dtype(s.dtype):
-            lines.append("  type     : numeric")
-            if non_null:
-                lines.append(f"  range    : {s.min()} → {s.max()}")
-                lines.append(f"  mean     : {s.mean():.2f}")
-            lines.append(f"  non-null : {non_null:,} / {len(df):,}")
-
-        elif pd.api.types.is_datetime64_any_dtype(s.dtype):
-            lines.append("  type     : datetime")
-            if non_null:
-                lines.append(f"  range    : {s.min().date()} → {s.max().date()}")
-
-        else:
-            uniq = s.dropna().unique()
-            n = len(uniq)
-            lines.append(f"  type     : text  ({n} distinct values)")
-            if n <= 40:
-                vals = " | ".join(sorted(str(v) for v in uniq))
-                lines.append(f"  values   : {vals}")
+        # Sanitize column names within this sheet
+        originals = raw.columns.tolist()
+        seen: dict[str, int] = {}
+        clean: list[str] = []
+        for c in originals:
+            base_col = _safe_col(str(c))
+            if base_col in seen:
+                seen[base_col] += 1
+                clean.append(f"{base_col}_{seen[base_col]}")
             else:
-                top = s.dropna().value_counts().head(8).index.tolist()
-                lines.append(f"  top-8    : {' | '.join(str(v) for v in top)}")
-            lines.append(f"  non-null : {non_null:,} / {len(df):,}")
+                seen[base_col] = 0
+                clean.append(base_col)
+
+        raw = raw.copy()
+        raw.columns = clean
+        col_maps[table_name] = dict(zip(originals, clean))
+        raw.to_sql(table_name, conn, if_exists="replace", index=False)
+        sheets[table_name] = raw
+
+    if not sheets:
+        raise ValueError("Excel file contains no non-empty sheets.")
+
+    return sheets, conn, col_maps
+
+
+def build_schema(sheets: dict[str, pd.DataFrame]) -> str:
+    """Build an LLM-friendly schema description for all loaded tables."""
+    lines = ["=== SQLITE DATABASE SCHEMA ===", ""]
+
+    for table_name, df in sheets.items():
+        lines += [
+            f"TABLE NAME : {table_name}",
+            f"TOTAL ROWS : {len(df):,}",
+            "",
+            "COLUMNS  (use these EXACT names in every SQL query)",
+            "─" * 60,
+        ]
+
+        for col in df.columns:
+            s = df[col]
+            non_null = int(s.notna().sum())
+            lines.append(f"\n{col}")
+
+            if pd.api.types.is_numeric_dtype(s.dtype):
+                lines.append("  type     : numeric")
+                if non_null:
+                    lines.append(f"  range    : {s.min()} → {s.max()}")
+                    lines.append(f"  mean     : {s.mean():.2f}")
+                lines.append(f"  non-null : {non_null:,} / {len(df):,}")
+
+            elif pd.api.types.is_datetime64_any_dtype(s.dtype):
+                lines.append("  type     : datetime")
+                if non_null:
+                    lines.append(f"  range    : {s.min().date()} → {s.max().date()}")
+
+            else:
+                uniq = s.dropna().unique()
+                n = len(uniq)
+                lines.append(f"  type     : text  ({n} distinct values)")
+                if n <= 40:
+                    vals = " | ".join(sorted(str(v) for v in uniq))
+                    lines.append(f"  values   : {vals}")
+                else:
+                    top = s.dropna().value_counts().head(8).index.tolist()
+                    lines.append(f"  top-8    : {' | '.join(str(v) for v in top)}")
+                lines.append(f"  non-null : {non_null:,} / {len(df):,}")
+
+        lines += ["", "─" * 30, ""]
 
     lines += [
-        "",
         "─" * 60,
         "SQL NOTES",
         "  • Partial text  : column LIKE '%value%'",
@@ -252,6 +298,7 @@ def build_schema(df: pd.DataFrame) -> str:
         "  • NULL check    : column IS NULL / IS NOT NULL",
         "  • Aggregation   : COUNT(*), SUM(col), AVG(col), GROUP BY col",
         "  • Sorting       : ORDER BY col DESC/ASC  LIMIT n",
+        "  • Multi-table   : SELECT a.col, b.col FROM table_a a JOIN table_b b ON a.id = b.id",
         "=== END SCHEMA ===",
     ]
     return "\n".join(lines)
@@ -353,6 +400,68 @@ RULES:
     return _strip_think(resp.choices[0].message.content)
 
 
+def make_excel_bytes(data: dict[str, list[dict]]) -> bytes:
+    """Build a styled Excel workbook from {sheet_name: [row_dict, ...]}.  Returns bytes."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, rows in data.items():
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
+            safe_name = sheet_name[:31]   # Excel sheet name limit
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            if not df.empty:
+                ws = writer.sheets[safe_name]
+                header_fill = PatternFill(start_color="1E2130", end_color="1E2130", fill_type="solid")
+                header_font = Font(bold=True, color="C5CBF5")
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                for col_idx, col_cells in enumerate(ws.columns, 1):
+                    max_len = max(
+                        (len(str(c.value)) if c.value is not None else 0) for c in col_cells
+                    )
+                    ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
+                ws.freeze_panes = "A2"
+    buf.seek(0)
+    return buf.read()
+
+
+def gen_sample_rows(
+    client: OpenAI, model: str, schema: str, n_rows: int
+) -> dict[str, list[dict]]:
+    """Ask the LLM to generate *n_rows* realistic sample rows per table.
+
+    Returns {table_name: [{col: val, ...}, ...]}
+    """
+    system = f"""You are a realistic data generator. Given a SQLite database schema, produce sample rows.
+
+{schema}
+
+STRICT OUTPUT RULES:
+1. Return ONLY valid JSON — no markdown fences, no explanation whatsoever.
+2. Top-level JSON format: {{"table_name": [{{"col": "val"}}, ...]}}
+3. Generate exactly {n_rows} rows per table listed in the schema.
+4. Use realistic, varied values that match each column's type and observed range.
+5. For text columns with known distinct values, use ONLY those listed values.
+6. Keep numeric values within the observed ranges shown in the schema.
+7. Do NOT use real personal names or sensitive data. Use clearly fictional identifiers."""
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": f"Generate {n_rows} sample rows per table now."},
+        ],
+        temperature=0.8,
+        max_tokens=4000,
+    )
+    raw = _strip_think(resp.choices[0].message.content)
+    # Strip accidental markdown fences
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    return json.loads(raw)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Request / Response models
 # ──────────────────────────────────────────────────────────────────────────────
@@ -377,7 +486,8 @@ class UploadResponse(BaseModel):
     row_count: int
     col_count: int
     columns: list[str]
-    schema_preview: str        # first 600 chars of the schema for display
+    schema_preview: str        # first 800 chars of the schema for display
+    sheets: dict[str, list[str]]   # {table_name: [col1, col2, ...]} per sheet
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -420,27 +530,31 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="File too large. Maximum 50 MB.")
 
     try:
-        df, conn, col_map = load_excel_bytes(content, file.filename)
+        sheets, conn, col_maps = load_excel_bytes(content, file.filename)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}")
 
-    schema = build_schema(df)
+    schema = build_schema(sheets)
     session_id = str(uuid.uuid4())
 
+    all_cols = [col for df in sheets.values() for col in df.columns]
     sessions[session_id] = {
         "conn": conn,
         "schema": schema,
         "history": [],
-        "col_names": list(df.columns),
+        "col_names": {t: list(df.columns) for t, df in sheets.items()},
+        "sheets": {t: df for t, df in sheets.items()},
         "request_count": 0,
+        "last_rows": None,
     }
 
     return UploadResponse(
         session_id=session_id,
-        row_count=len(df),
-        col_count=len(df.columns),
-        columns=list(df.columns),
+        row_count=sum(len(df) for df in sheets.values()),
+        col_count=len(all_cols),
+        columns=all_cols,
         schema_preview=schema[:800],
+        sheets={t: list(df.columns) for t, df in sheets.items()},
     )
 
 
@@ -457,6 +571,25 @@ def delete_session(session_id: str):
         sessions[session_id]["conn"].close()
         del sessions[session_id]
     return {"deleted": True}
+
+
+@app.get("/sessions/{session_id}/export")
+def export_excel(session_id: str):
+    """Download last query results as a styled .xlsx file."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    rows = sessions[session_id].get("last_rows")
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No query results to export. Run a query first.",
+        )
+    xlsx_bytes = make_excel_bytes({"Query Results": rows})
+    return StreamingResponse(
+        BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=lensvare_export.xlsx"},
+    )
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -529,8 +662,9 @@ def ask(req: AskRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM error generating response: {exc}")
 
-    # Update history for follow-up questions
+    # Update history and cache last result for export
     sess["history"].append({"q": req.question, "sql": sql})
+    sess["last_rows"] = rows
 
     return AskResponse(
         answer=answer,
@@ -566,9 +700,26 @@ def ask_stream(req: AskRequest):
         raise HTTPException(status_code=400, detail=f"Could not initialise client: {exc}")
 
     def event_stream():
-        # ── Detect @visualize flag ────────────────────────────────
+        # ── Detect keyword flags ──────────────────────────────────
         is_visualize = '@visualize' in req.question.lower()
-        clean_q = re.sub(r'@visualize\s*', '', req.question, flags=re.IGNORECASE).strip()
+        is_generate  = '@generate'  in req.question.lower()
+        clean_q = re.sub(r'@(?:visualize|generate)\s*', '', req.question, flags=re.IGNORECASE).strip()
+
+        # ── @generate: skip SQL, produce a sample Excel file ──────
+        if is_generate:
+            n_match = re.search(r'\b(\d+)\b', clean_q)
+            n_rows  = min(max(int(n_match.group(1)) if n_match else 15, 1), 100)
+            try:
+                sample     = gen_sample_rows(client, req.model, sess["schema"], n_rows)
+                xlsx_bytes = make_excel_bytes(sample)
+                b64        = base64.b64encode(xlsx_bytes).decode()
+                yield f"data: {json.dumps({'type': 'generate', 'filename': 'sample_lensvare.xlsx', 'data': b64})}\n\n"
+            except json.JSONDecodeError:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'LLM returned invalid JSON for sample data — please try again.'})}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
 
         # ── Phase 1: Generate SQL (blocking, fast) ───────────────
         try:
@@ -596,6 +747,9 @@ def ask_stream(req: AskRequest):
             yield f"data: {json.dumps({'type': 'meta', 'sql': sql, 'row_count': 0})}\n\n"
             yield f"data: {json.dumps({'type': 'error', 'message': err})}\n\n"
             return
+
+        # Cache results for export
+        sess["last_rows"] = rows
 
         # Signal frontend: SQL ready, prose streaming starts now
         yield f"data: {json.dumps({'type': 'meta', 'sql': sql, 'row_count': len(rows)})}\n\n"

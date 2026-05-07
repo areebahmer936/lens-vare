@@ -374,6 +374,21 @@
       margin-top: 4px;
     }
 
+    /* Export Excel button */
+    .export-btn {
+      background: rgba(79,110,247,0.12);
+      border: 1px solid rgba(79,110,247,0.3);
+      color: var(--accent);
+      border-radius: 6px;
+      padding: 3px 10px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+      margin-top: 4px;
+    }
+    .export-btn:hover { background: rgba(79,110,247,0.22); }
+
     /* Error message */
     .error-bubble {
       background: #2a1515;
@@ -533,6 +548,10 @@
           <div class="stat-value" id="statCols">—</div>
           <div class="stat-label">columns</div>
         </div>
+        <div class="stat-card" id="statSheetsCell" style="display:none;">
+          <div class="stat-value" id="statSheets">—</div>
+          <div class="stat-label">sheets</div>
+        </div>
       </div>
     </div>
 
@@ -669,6 +688,7 @@ async function uploadFile(file) {
   document.getElementById('uploadZone').style.display = 'none';
   document.getElementById('fileBadge').style.display = 'none';
   document.getElementById('statsGrid').style.display = 'none';
+  document.getElementById('statSheetsCell').style.display = 'none';
   document.getElementById('statusPill').textContent = 'Uploading…';
   document.getElementById('statusPill').className = 'status-pill';
 
@@ -685,6 +705,13 @@ async function uploadFile(file) {
     document.getElementById('fileBadge').style.display = 'flex';
     document.getElementById('statRows').textContent = data.row_count.toLocaleString();
     document.getElementById('statCols').textContent = data.col_count;
+
+    const sheetCount = Object.keys(data.sheets || {}).length;
+    if (sheetCount > 1) {
+      document.getElementById('statSheets').textContent = sheetCount;
+      document.getElementById('statSheetsCell').style.display = '';
+    }
+
     document.getElementById('statsGrid').style.display = 'grid';
 
     document.getElementById('statusPill').textContent = `✓ ${file.name}`;
@@ -700,7 +727,8 @@ async function uploadFile(file) {
     document.getElementById('sendBtn').disabled = false;
     document.getElementById('questionInput').focus();
 
-    showToast(`Loaded ${data.row_count.toLocaleString()} rows, ${data.col_count} columns`, 'success');
+    const sheetInfo = sheetCount > 1 ? `, ${sheetCount} sheets` : '';
+    showToast(`Loaded ${data.row_count.toLocaleString()} rows, ${data.col_count} columns${sheetInfo}`, 'success');
   } catch (e) {
     document.getElementById('uploadZone').style.display = '';
     document.getElementById('statusPill').textContent = 'Upload failed';
@@ -802,6 +830,18 @@ async function sendQuestion() {
             finalizeChartMessage(botEl, evt.config, sqlText, rowCount);
             botEl = null;  // already finalized — skip 'done' handler
 
+          } else if (evt.type === 'generate') {
+            removeEl(thinkId);
+            const bytes = Uint8Array.from(atob(evt.data), c => c.charCodeAt(0));
+            const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = evt.filename || 'sample_lensvare.xlsx';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+            appendGenerateMessage(evt.filename || 'sample_lensvare.xlsx');
+            botEl = null;
+
           } else if (evt.type === 'done') {
             if (botEl) finalizeBotMessage(botEl, streamedText, sqlText, rowCount);
 
@@ -894,6 +934,7 @@ function finalizeBotMessage(el, text, sql, rowCount) {
     <div class="msg-bubble">${linkify(escHtml(text).replace(/\n/g,'<br>'))}</div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:2px;">
       <span class="row-count-badge">📊 ${rowCount.toLocaleString()} rows matched</span>
+      <button class="export-btn" onclick="downloadExport()">⬇ Excel</button>
       <div class="sql-expander">
         <button class="sql-toggle" onclick="toggleSql('${sqlId}',this)">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 1l4 4-4 4"/></svg>
@@ -934,6 +975,7 @@ function finalizeChartMessage(el, config, sql, rowCount) {
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px;">
       <span class="row-count-badge">📊 ${rowCount.toLocaleString()} rows matched</span>
+      <button class="export-btn" onclick="downloadExport()">⬇ Excel</button>
       <div class="sql-expander">
         <button class="sql-toggle" onclick="toggleSql('${sqlId}',this)">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 1l4 4-4 4"/></svg>
@@ -969,6 +1011,25 @@ function appendError(msg) {
     <div class="msg-meta">LensVare · ${nowTime()}</div>
   `;
   area.appendChild(div);
+}
+
+function downloadExport() {
+  if (!sessionId) { showToast('No active session.', 'error'); return; }
+  const a = document.createElement('a');
+  a.href = `${API}/sessions/${sessionId}/export`;
+  a.download = 'lensvare_export.xlsx';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+function appendGenerateMessage(filename) {
+  const area = document.getElementById('chatArea');
+  const div = document.createElement('div');
+  div.className = 'message bot';
+  div.innerHTML = `
+    <div class="msg-bubble">✅ Sample file generated — <strong>${escHtml(filename)}</strong> is downloading.</div>
+    <div class="msg-meta">LensVare · ${nowTime()}</div>
+  `;
+  area.appendChild(div); scrollChatBottom();
 }
 
 function toggleSql(id, btn) {
