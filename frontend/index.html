@@ -631,8 +631,18 @@ function onProviderChange() {
     opt.value = m; opt.textContent = m;
     mSel.appendChild(opt);
   });
-  const link = document.getElementById('keyLink');
-  link.innerHTML = `<a href="${p.key_url}" target="_blank">Get key ↗</a>`;
+  const link    = document.getElementById('keyLink');
+  const keyInput = document.getElementById('apiKey');
+  if (p.key_preset) {
+    keyInput.disabled     = true;
+    keyInput.value        = '';
+    keyInput.placeholder  = 'API key configured on server';
+    link.innerHTML        = '';
+  } else {
+    keyInput.disabled     = false;
+    keyInput.placeholder  = 'sk-…';
+    link.innerHTML        = `<a href="${p.key_url}" target="_blank">Get key ↗</a>`;
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -724,7 +734,8 @@ async function sendQuestion() {
   const provider = document.getElementById('providerSelect').value;
   const model    = document.getElementById('modelSelect').value;
   const apiKey   = document.getElementById('apiKey').value.trim();
-  if (!apiKey) { showToast('Please enter your API key in the sidebar.', 'error'); return; }
+  const keyPreset = providers[provider]?.key_preset || false;
+  if (!keyPreset && !apiKey) { showToast('Please enter your API key in the sidebar.', 'error'); return; }
 
   input.disabled = true;
   document.getElementById('sendBtn').disabled = true;

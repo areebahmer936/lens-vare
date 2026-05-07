@@ -14,6 +14,7 @@ GET  /providers         — List available providers and their models
 GET  /health            — Liveness probe for Docker/hosting health checks
 """
 
+import os
 import re
 import json
 import uuid
@@ -147,6 +148,26 @@ PROVIDERS: dict[str, dict] = {
         "note": "Low-latency inference for open-weight models.",
     },
 }
+
+# Env-var name for each provider's API key.
+# If the env var is set, the server uses it and the frontend hides the key field.
+PROVIDER_ENV_KEYS: dict[str, str] = {
+    "Kilo":                     "KILO_API_KEY",
+    "DashScope (Qwen)":         "DASHSCOPE_API_KEY",
+    "Moonshot (Kimi)":          "MOONSHOT_API_KEY",
+    "OpenRouter (all models)":  "OPENROUTER_API_KEY",
+    "Together.ai":              "TOGETHER_API_KEY",
+}
+
+
+def _resolve_api_key(provider: str, client_key: str) -> str:
+    """Return the server-side env key for *provider* if set, else the client-supplied key."""
+    env_var = PROVIDER_ENV_KEYS.get(provider)
+    if env_var:
+        server_key = os.environ.get(env_var, "").strip()
+        if server_key:
+            return server_key
+    return client_key
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,6 +396,10 @@ def list_providers():
             "models": data["models"],
             "key_url": data["key_url"],
             "note": data["note"],
+            # True when a server-side env key is configured for this provider
+            "key_preset": bool(
+                os.environ.get(PROVIDER_ENV_KEYS.get(name, ""), "").strip()
+            ),
         }
         for name, data in PROVIDERS.items()
     }
@@ -463,7 +488,7 @@ def ask(req: AskRequest):
 
     prov = PROVIDERS[req.provider]
     try:
-        client = OpenAI(api_key=req.api_key, base_url=prov["base_url"])
+        client = OpenAI(api_key=_resolve_api_key(req.provider, req.api_key), base_url=prov["base_url"])
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise client: {exc}")
 
@@ -536,7 +561,7 @@ def ask_stream(req: AskRequest):
 
     prov = PROVIDERS[req.provider]
     try:
-        client = OpenAI(api_key=req.api_key, base_url=prov["base_url"])
+        client = OpenAI(api_key=_resolve_api_key(req.provider, req.api_key), base_url=prov["base_url"])
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise client: {exc}")
 
