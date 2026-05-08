@@ -426,6 +426,49 @@ def make_excel_bytes(data: dict[str, list[dict]]) -> bytes:
     return buf.read()
 
 
+def _extract_json_obj(text: str) -> dict:
+    """Robustly extract the first top-level JSON object from LLM output.
+
+    Handles: markdown fences, preamble text, trailing commentary, <think> tags.
+    Raises json.JSONDecodeError if no valid JSON object found.
+    """
+    # Remove <think>...</think> blocks first
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove ALL markdown code fences (```json ... ``` anywhere in text)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = text.replace("```", "").strip()
+    # Find the first '{' and walk to its matching '}'
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found in response", text, 0)
+    depth = 0
+    end = -1
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        raise json.JSONDecodeError("Unmatched braces in JSON response", text, start)
+    return json.loads(text[start : end + 1])
+
+
 def gen_sample_rows(
     client: OpenAI, model: str, schema: str, n_rows: int
 ) -> dict[str, list[dict]]:
@@ -433,33 +476,46 @@ def gen_sample_rows(
 
     Returns {table_name: [{col: val, ...}, ...]}
     """
-    system = f"""You are a realistic data generator. Given a SQLite database schema, produce sample rows.
-
-{schema}
-
-STRICT OUTPUT RULES:
-1. Return ONLY valid JSON — no markdown fences, no explanation whatsoever.
-2. Top-level JSON format: {{"table_name": [{{"col": "val"}}, ...]}}
-3. Generate exactly {n_rows} rows per table listed in the schema.
-4. Use realistic, varied values that match each column's type and observed range.
-5. For text columns with known distinct values, use ONLY those listed values.
-6. Keep numeric values within the observed ranges shown in the schema.
-7. Do NOT use real personal names or sensitive data. Use clearly fictional identifiers."""
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": f"Generate {n_rows} sample rows per table now."},
-        ],
-        temperature=0.8,
-        max_tokens=4000,
+    system = (
+        "You are a data generator. Your ENTIRE response must be a single valid JSON object "
+        "with NO markdown, NO explanation, NO code fences — just raw JSON.\n\n"
+        f"Database schema:\n{schema}\n\n"
+        f"Required format: {{\"table_name\": [{{\"col\": \"val\", ...}}, ...]}}\n"
+        f"Rules:\n"
+        f"- Generate exactly {n_rows} rows per table.\n"
+        f"- Use realistic, varied values matching each column's type and observed range.\n"
+        f"- For text columns with listed distinct values, use ONLY those values.\n"
+        f"- Keep numeric values within the observed ranges.\n"
+        f"- Use clearly fictional identifiers — no real personal data.\n"
+        f"- Output MUST start with {{ and end with }}."
     )
-    raw = _strip_think(resp.choices[0].message.content)
-    # Strip accidental markdown fences
-    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-    raw = re.sub(r"\s*```$", "", raw.strip())
-    return json.loads(raw)
+
+    # Try with json_object response format first (supported by most OpenAI-compat providers)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"Generate {n_rows} sample rows now. Reply with JSON only."},
+            ],
+            temperature=0.7,
+            max_tokens=4000,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        # Fallback: provider doesn't support response_format
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"Generate {n_rows} sample rows now. Reply with JSON only."},
+            ],
+            temperature=0.7,
+            max_tokens=4000,
+        )
+
+    raw = resp.choices[0].message.content or ""
+    return _extract_json_obj(raw)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
