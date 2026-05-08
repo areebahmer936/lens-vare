@@ -434,13 +434,13 @@ def _extract_json_obj(text: str) -> dict:
     """
     # Remove <think>...</think> blocks first
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Remove ALL markdown code fences (```json ... ``` anywhere in text)
+    # Remove ALL markdown code fences
     text = re.sub(r"```(?:json)?\s*", "", text)
     text = text.replace("```", "").strip()
     # Find the first '{' and walk to its matching '}'
     start = text.find("{")
     if start == -1:
-        raise json.JSONDecodeError("No JSON object found in response", text, 0)
+        raise ValueError(f"No JSON object '{{' found in LLM response. Raw: {text[:300]!r}")
     depth = 0
     end = -1
     in_str = False
@@ -465,57 +465,58 @@ def _extract_json_obj(text: str) -> dict:
                 end = i
                 break
     if end == -1:
-        raise json.JSONDecodeError("Unmatched braces in JSON response", text, start)
-    return json.loads(text[start : end + 1])
+        raise ValueError(f"Unmatched braces in LLM response. Raw: {text[:300]!r}")
+    fragment = text[start : end + 1]
+    try:
+        return json.loads(fragment)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON parse error: {e}. Fragment: {fragment[:300]!r}") from e
 
 
 def gen_sample_rows(
-    client: OpenAI, model: str, schema: str, n_rows: int
+    sheets: dict[str, pd.DataFrame],
+    n_rows: int,
 ) -> dict[str, list[dict]]:
-    """Ask the LLM to generate *n_rows* realistic sample rows per table.
+    """Generate *n_rows* sample rows per table by sampling real column values.
 
+    No LLM call — instant, always succeeds, values are drawn from actual data.
     Returns {table_name: [{col: val, ...}, ...]}
     """
-    system = (
-        "You are a data generator. Your ENTIRE response must be a single valid JSON object "
-        "with NO markdown, NO explanation, NO code fences — just raw JSON.\n\n"
-        f"Database schema:\n{schema}\n\n"
-        f"Required format: {{\"table_name\": [{{\"col\": \"val\", ...}}, ...]}}\n"
-        f"Rules:\n"
-        f"- Generate exactly {n_rows} rows per table.\n"
-        f"- Use realistic, varied values matching each column's type and observed range.\n"
-        f"- For text columns with listed distinct values, use ONLY those values.\n"
-        f"- Keep numeric values within the observed ranges.\n"
-        f"- Use clearly fictional identifiers — no real personal data.\n"
-        f"- Output MUST start with {{ and end with }}."
-    )
+    import random
 
-    # Try with json_object response format first (supported by most OpenAI-compat providers)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": f"Generate {n_rows} sample rows now. Reply with JSON only."},
-            ],
-            temperature=0.7,
-            max_tokens=4000,
-            response_format={"type": "json_object"},
-        )
-    except Exception:
-        # Fallback: provider doesn't support response_format
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": f"Generate {n_rows} sample rows now. Reply with JSON only."},
-            ],
-            temperature=0.7,
-            max_tokens=4000,
-        )
+    result: dict[str, list[dict]] = {}
+    for table, df in sheets.items():
+        rows: list[dict] = []
+        # Pre-compute per-column candidate pools once
+        pools: dict[str, list] = {}
+        for col in df.columns:
+            s = df[col].dropna()
+            if len(s) == 0:
+                pools[col] = [None]
+            elif pd.api.types.is_numeric_dtype(s.dtype):
+                pools[col] = s.tolist()          # sample directly from real values
+            elif pd.api.types.is_datetime64_any_dtype(s.dtype):
+                # Convert to plain date strings
+                pools[col] = [str(v)[:10] for v in s.tolist()]
+            else:
+                uniq = list(s.unique())
+                pools[col] = uniq if len(uniq) <= 200 else s.sample(200, replace=False).tolist()
 
-    raw = resp.choices[0].message.content or ""
-    return _extract_json_obj(raw)
+        for _ in range(n_rows):
+            row: dict = {}
+            for col in df.columns:
+                val = random.choice(pools[col])
+                # Convert numpy scalars / Timestamps to plain Python types
+                if hasattr(val, "item"):          # numpy scalar
+                    val = val.item()
+                elif hasattr(val, "isoformat"):   # Timestamp
+                    val = val.isoformat()[:10]
+                row[col] = val
+            rows.append(row)
+        result[table] = rows
+
+    print(f"[gen_sample_rows] generated {n_rows} rows for tables: {list(result.keys())}", flush=True)
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -764,16 +765,27 @@ def ask_stream(req: AskRequest):
         # ── @generate: skip SQL, produce a sample Excel file ──────
         if is_generate:
             n_match = re.search(r'\b(\d+)\b', clean_q)
-            n_rows  = min(max(int(n_match.group(1)) if n_match else 15, 1), 100)
+            n_rows  = min(max(int(n_match.group(1)) if n_match else 5, 1), 20)
+
+            # ── Optional column filter: fuzzy-match column names mentioned in the question ──
+            q_lower = clean_q.lower()
+            filtered_sheets: dict[str, pd.DataFrame] = {}
+            for tname, df in sess["sheets"].items():
+                wanted = [
+                    col for col in df.columns
+                    if col.lower().replace("_", " ") in q_lower
+                    or col.lower() in q_lower
+                ]
+                filtered_sheets[tname] = df[wanted] if wanted else df
+
             try:
-                sample     = gen_sample_rows(client, req.model, sess["schema"], n_rows)
+                sample     = gen_sample_rows(filtered_sheets, n_rows)
                 xlsx_bytes = make_excel_bytes(sample)
                 b64        = base64.b64encode(xlsx_bytes).decode()
                 yield f"data: {json.dumps({'type': 'generate', 'filename': 'sample_lensvare.xlsx', 'data': b64})}\n\n"
-            except json.JSONDecodeError:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'LLM returned invalid JSON for sample data — please try again.'})}\n\n"
             except Exception as exc:
-                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+                print(f"[gen_sample_rows ERROR] {type(exc).__name__}: {exc}", flush=True)
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Sample generation failed: {exc}'})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
