@@ -473,49 +473,70 @@ def _extract_json_obj(text: str) -> dict:
         raise ValueError(f"JSON parse error: {e}. Fragment: {fragment[:300]!r}") from e
 
 
+def _clean_val(val):
+    """Convert a single cell value to a plain JSON-serialisable Python type."""
+    if val is None:
+        return None
+    if hasattr(val, "item"):          # numpy scalar
+        val = val.item()
+    if hasattr(val, "isoformat"):     # Timestamp / datetime
+        return val.isoformat()[:10]
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
 def gen_sample_rows(
     sheets: dict[str, pd.DataFrame],
-    n_rows: int,
+    n_rows,                          # int for sampling, None for ALL rows
 ) -> dict[str, list[dict]]:
-    """Generate *n_rows* sample rows per table by sampling real column values.
+    """Generate rows per table.
 
-    No LLM call — instant, always succeeds, values are drawn from actual data.
+    n_rows=None  → export every row as-is (complete file).
+    n_rows=int   → draw *n_rows* random rows by sampling per-column value pools.
+    No LLM call — instant, always succeeds.
     Returns {table_name: [{col: val, ...}, ...]}
     """
     import random
 
     result: dict[str, list[dict]] = {}
     for table, df in sheets.items():
-        rows: list[dict] = []
-        # Pre-compute per-column candidate pools once
-        pools: dict[str, list] = {}
-        for col in df.columns:
-            s = df[col].dropna()
-            if len(s) == 0:
-                pools[col] = [None]
-            elif pd.api.types.is_numeric_dtype(s.dtype):
-                pools[col] = s.tolist()          # sample directly from real values
-            elif pd.api.types.is_datetime64_any_dtype(s.dtype):
-                # Convert to plain date strings
-                pools[col] = [str(v)[:10] for v in s.tolist()]
-            else:
-                uniq = list(s.unique())
-                pools[col] = uniq if len(uniq) <= 200 else s.sample(200, replace=False).tolist()
-
-        for _ in range(n_rows):
-            row: dict = {}
+        if n_rows is None:
+            # Complete export — iterate all rows, clean types
+            rows = [
+                {col: _clean_val(row[col]) for col in df.columns}
+                for _, row in df.iterrows()
+            ]
+        else:
+            # Sampled export — build per-column pools, then draw n_rows
+            pools: dict[str, list] = {}
             for col in df.columns:
-                val = random.choice(pools[col])
-                # Convert numpy scalars / Timestamps to plain Python types
-                if hasattr(val, "item"):          # numpy scalar
-                    val = val.item()
-                elif hasattr(val, "isoformat"):   # Timestamp
-                    val = val.isoformat()[:10]
-                row[col] = val
-            rows.append(row)
+                s = df[col].dropna()
+                if len(s) == 0:
+                    pools[col] = [None]
+                elif pd.api.types.is_numeric_dtype(s.dtype):
+                    pools[col] = s.tolist()
+                elif pd.api.types.is_datetime64_any_dtype(s.dtype):
+                    pools[col] = [str(v)[:10] for v in s.tolist()]
+                else:
+                    uniq = list(s.unique())
+                    pools[col] = uniq if len(uniq) <= 200 else s.sample(200, replace=False).tolist()
+
+            rows = []
+            for _ in range(n_rows):
+                row: dict = {}
+                for col in df.columns:
+                    row[col] = _clean_val(random.choice(pools[col]))
+                rows.append(row)
+
         result[table] = rows
 
-    print(f"[gen_sample_rows] generated {n_rows} rows for tables: {list(result.keys())}", flush=True)
+    total = sum(len(v) for v in result.values())
+    print(f"[gen_sample_rows] {total} rows (n_rows={n_rows}) for tables: {list(result.keys())}", flush=True)
     return result
 
 
@@ -764,12 +785,21 @@ def ask_stream(req: AskRequest):
 
         # ── @generate: skip SQL, produce a sample Excel file ──────
         if is_generate:
-            n_match = re.search(r'\b(\d+)\b', clean_q)
-            n_rows  = min(max(int(n_match.group(1)) if n_match else 5, 1), 20)
+            q_lower = clean_q.lower()
+
+            # ── Row count: "complete / all / full / entire" → all rows; else parse number ──
+            is_complete = bool(re.search(r'\b(complete|all|full|entire)\b', q_lower))
+            n_match     = re.search(r'\b(\d+)\b', clean_q)
+            if is_complete:
+                n_rows = None                              # export every row
+            elif n_match:
+                n_rows = min(max(int(n_match.group(1)), 1), 10_000)
+            else:
+                n_rows = 5                                 # default sample
 
             # ── Optional column filter: fuzzy-match column names mentioned in the question ──
-            q_lower = clean_q.lower()
             filtered_sheets: dict[str, pd.DataFrame] = {}
+            wanted_cols: list[str] = []
             for tname, df in sess["sheets"].items():
                 wanted = [
                     col for col in df.columns
@@ -777,12 +807,28 @@ def ask_stream(req: AskRequest):
                     or col.lower() in q_lower
                 ]
                 filtered_sheets[tname] = df[wanted] if wanted else df
+                wanted_cols.extend(wanted if wanted else df.columns.tolist())
+
+            # ── Build human-readable label for the frontend message ──
+            total_src_rows = sum(len(df) for df in sess["sheets"].values())
+            if n_rows is None:
+                row_label = f"complete file · {total_src_rows} rows"
+            else:
+                row_label = f"{n_rows} sample row{'s' if n_rows != 1 else ''}"
+
+            all_orig_cols = [c for df in sess["sheets"].values() for c in df.columns]
+            if sorted(wanted_cols) != sorted(all_orig_cols):
+                col_label = " · columns: " + ", ".join(dict.fromkeys(wanted_cols))
+            else:
+                col_label = ""
+
+            label = row_label + col_label
 
             try:
                 sample     = gen_sample_rows(filtered_sheets, n_rows)
                 xlsx_bytes = make_excel_bytes(sample)
                 b64        = base64.b64encode(xlsx_bytes).decode()
-                yield f"data: {json.dumps({'type': 'generate', 'filename': 'sample_lensvare.xlsx', 'data': b64})}\n\n"
+                yield f"data: {json.dumps({'type': 'generate', 'filename': 'sample_lensvare.xlsx', 'data': b64, 'label': label})}\n\n"
             except Exception as exc:
                 print(f"[gen_sample_rows ERROR] {type(exc).__name__}: {exc}", flush=True)
                 yield f"data: {json.dumps({'type': 'error', 'message': f'Sample generation failed: {exc}'})}\n\n"

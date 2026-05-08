@@ -839,7 +839,7 @@ async function sendQuestion() {
             a.href = url; a.download = evt.filename || 'sample_lensvare.xlsx';
             document.body.appendChild(a); a.click(); document.body.removeChild(a);
             setTimeout(() => URL.revokeObjectURL(url), 5000);
-            appendGenerateMessage(evt.filename || 'sample_lensvare.xlsx');
+            appendGenerateMessage(evt.filename || 'sample_lensvare.xlsx', evt.label || '');
             botEl = null;
 
           } else if (evt.type === 'done') {
@@ -1021,12 +1021,13 @@ function downloadExport() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
-function appendGenerateMessage(filename) {
+function appendGenerateMessage(filename, label) {
   const area = document.getElementById('chatArea');
   const div = document.createElement('div');
   div.className = 'message bot';
+  const labelHtml = label ? ` <span style="opacity:.75;font-size:.9em">(${escHtml(label)})</span>` : '';
   div.innerHTML = `
-    <div class="msg-bubble">✅ Sample file generated — <strong>${escHtml(filename)}</strong> is downloading.</div>
+    <div class="msg-bubble">✅ <strong>${escHtml(filename)}</strong>${labelHtml} is downloading.</div>
     <div class="msg-meta">LensVare · ${nowTime()}</div>
   `;
   area.appendChild(div); scrollChatBottom();
